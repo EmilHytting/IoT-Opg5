@@ -189,3 +189,119 @@ mens UART1 konverterer store bogstaver til små bogstaver og sender tegnet
 tilbage. Tilslut en seriel terminal, udløs INT0 på PD2, og kontrollér at
 tællingen vises på begge UART-forbindelser. Sekundtælleren skal stige én
 gang pr. sekund på UART1.
+
+
+Opgave 5
+--------
+
+Formål
+------
+Vi har samlet funktionerne fra de tidligere opgaver og tilføjet en
+ringbuffer til modtagelse af data. Programmet kører på ATmega328PB ved
+8 MHz. UART0 modtager data fra testprogrammet, og UART1 sender de samme
+bytes tilbage via CP2102. Begge forbindelser bruger 9600 baud og 8N1.
+Der ændres ikke mellem store og små bogstaver i denne opgave, da alle
+byteværdier fra 0 til 255 skal kunne sendes uændret tilbage.
+
+Opstart og handshake
+-------------------
+Vi har lavet en tilstandsmaskine, så ringbufferen først aktiveres efter
+en opstartssekvens. Først venter programmet på et kolon (:) på UART0.
+Når det modtages, sender programmet brugernavnet i formatet :Lonneberg:
+på UART1. Derefter venter det på et semikolon (;), som starter datatesten.
+Testprogrammet kan nu sende værdierne 0 til 255 gentagne gange.
+
+Ringbuffer og videresendelse
+---------------------------
+Ringbufferen er et array med 256 pladser og to indeks: head og tail.
+UART0's modtageinterrupt lægger hver modtaget byte ved head og flytter
+head frem. UART1's interrupt for ledigt senderegister tager en byte ved
+tail, sender den og flytter tail frem. Afsendelsen bruger dermed ingen
+venteløkke og kan fortsætte, mens hovedprogrammet opdaterer displayet.
+
+Begge indeks er uint8_t og går automatisk fra 255 tilbage til 0.
+Når head og tail er ens, er bufferens indhold sendt. Én plads holdes
+ledig, så vi kan skelne mellem en fuld og en tom buffer. Der er derfor
+plads til 255 ventende bytes. Delte tællere og tilstande læses eller
+ændres atomisk, hvor flere operationer skal hænge sammen.
+
+Buffer overrun og nulstilling
+----------------------------
+Hvis næste head-position rammer tail, er bufferens kapacitet brugt.
+Programmet stopper datatesten, kasserer de ventende bytes og rapporterer
+den første afviste byte på UART1. Rapporten skrives som et decimalt tal
+med semikolon før og efter, for eksempel ;255;. Derefter venter programmet
+på minus (-) eller underscore (_) og vender tilbage til opstartstilstanden.
+UART-fejl stopper også testen og rapporterer den forventede byte som
+et estimat. En fejltæller registrerer disse hændelser.
+
+Under datatesten bruges underscore (_) til nulstilling, når værdien ikke
+er den næste forventede byte. Tegnet har også byteværdien 95 og skal
+derfor sendes videre, når 95 forventes. Minus har byteværdien 45 og er
+kun et nulstillingstegn i fejltilstanden. Protokollen er tvetydig, hvis
+testprogrammet sender underscore som nulstilling netop, når 95 forventes.
+Denne situation skal stadig afklares med lærerens testprogram.
+
+Trykknap og eksternt interrupt
+-----------------------------
+Vi har konfigureret INT0 på PD2 til at reagere på begge flanker. Knappen
+forudsættes tilsluttet mellem PD2 og GND med intern pull-up aktiveret.
+Interrupt-rutinen læser PD2 og øger enten tælleren for nedadgående eller
+opadgående flanker. Samtidig skifter LED'en på PB2 tilstand.
+Hovedprogrammet opdaterer derefter de to tællere i displayet.
+Der er ingen software-debounce, så kontaktprel kan give flere interrupts
+ved ét tryk. Det er de elektriske flanker, der tælles.
+
+Timer1 og sekundtæller
+---------------------
+Timer1 kører i CTC-tilstand med en præskaler på 256. Ved 8 MHz bruges
+OCR1A = 31249, så der kommer et interrupt hvert sekund. Interrupt-rutinen
+øger timer_seconds, skifter LED'en på PB1 og sætter timer_second_flag.
+Hovedprogrammet bruger flaget til at planlægge en opdatering af displayet.
+Sekunderne tælles direkte i interruptet, så displayarbejdet ikke medfører,
+at et timer-tick overses. Tælleren starter ved nul efter genstart.
+
+SSD1306-display
+---------------
+Vi har indsat lærerens SSD1306-driver til et 128x64-display på adresse
+0x3C. Displayet bruger TWI0 med SDA på PC4 og SCL på PC5. Driveren bruger
+projektets clockdefinition på 8 MHz. Vi har desuden begrænset ventetiden
+ved afsendelse af I2C-bytes og tekstlængden til 21 tegn pr. displaylinje.
+Hvis displayet ikke kan initialiseres, fortsætter UART-testen alligevel.
+
+Displayets otte linjer viser følgende, med linjenumre fra 0:
+
+  0: Antal nedadgående knapflanker.
+  1: Antal opadgående knapflanker.
+  2: Antal sekunder siden opstart.
+  3: De seneste fem bytes lagt i ringbufferen, ældste værdi til venstre.
+  4: Den faste tekst "Embedded Styrer !!!".
+  5: Den højeste bufferfyldning siden opstart.
+  6: Antal overrun- og UART-fejlhændelser siden opstart.
+  7: Brugernavn og nummeret på den aktuelle protokoltilstand.
+
+De fem bytes vises som decimale tal fra 000 til 255, så også ikke-printbare
+tegn kan læses. Displayet opdateres i hovedløkken, én linje ad gangen.
+Alle linjer planlægges opdateret hvert sekund, og knaplinjerne opdateres
+også efter eksterne interrupts. Driverens font viser små bogstaver som store.
+
+Ekstra funktion
+---------------
+Som ekstra funktion til opgaven har vi valgt at vise bufferens højeste
+fyldning og antallet af fejlhændelser. Det giver et overblik over belastning
+og fejl under testen. Værdierne bevares under nye testsekvenser, men
+nulstilles ved genstart af boardet.
+
+Build og test
+-------------
+Vi har tilføjet build.ps1 og en byggeopgave til VS Code. Ctrl+Shift+B
+bygger projektet til ATmega328PB og opretter en ELF fil og en HEX fil i out.
+Projektet er bygget med AVR GCC uden advarsler.
+
+Vi har også testet UART koden med simulerede registre. Testene dækker
+opstartssekvensen, data før start, fire gennemløb af 0 til 255, korrekt
+rækkefølge, wrap af indeks, de seneste fem værdier, nulstilling, fuld
+buffer, fejlrapportering og hardware overrun. Disse tests er bestået.
+De simulerer ikke elektriske signaler eller samtidige interrupts.
+Programmet mangler stadig afprøvning på det fysiske board og sammen
+med lærerens testprogram. De valgte pins skal kontrolleres mod opkoblingen.

@@ -1,34 +1,83 @@
-#include <avr/interrupt.h>
-#include <avr/io.h>
-#include <stdint.h>
 #include "Include/ProjectDefine/ProjectDefines.h"
+#include "Include/UART/UART.h"
 #include "Include/Timer/Timer.h"
+#include "Include/Display/ssd1306_328pb.h"
+#include <util/atomic.h>
+#include <stdio.h>
 
-static volatile uint16_t external_count;
-static volatile uint8_t external_event;
-static volatile uint32_t seconds;
+static volatile uint32_t falling_edges, rising_edges;
+static volatile uint8_t button_dirty;
 
-static void U0c(char c){while(!(UCSR0A&(1<<UDRE0))){} UDR0=c;}
-static void U1c(char c){while(!(UCSR1A&(1<<UDRE1))){} UDR1=c;}
-static void U0s(const char*s){while(*s)U0c(*s++);}
-static void U1s(const char*s){while(*s)U1c(*s++);}
-static void Number(uint32_t n,void(*put)(char)){char d[10];uint8_t l=0;if(!n){put('0');return;}while(n){d[l++]=(char)('0'+n%10UL);n/=10UL;}while(l)put(d[--l]);}
-
-static void UART_Init(void){
-  UBRR0=MyUBRR; UCSR0A=0; UCSR0B=(1<<RXEN0)|(1<<TXEN0)|(1<<RXCIE0); UCSR0C=(1<<UCSZ01)|(1<<UCSZ00);
-  UBRR1=MyUBRR; UCSR1A=0; UCSR1B=(1<<RXEN1)|(1<<TXEN1)|(1<<RXCIE1); UCSR1C=(1<<UCSZ11)|(1<<UCSZ10);
+ISR(INT0_vect) {
+    /* Any change on PD2: low = falling, high = rising. */
+    if (PIND & (1 << PD2)) rising_edges++;
+    else falling_edges++;
+    PORTB ^= (1 << YellowLedBit);
+    button_dirty = 1;
 }
-static void INT0_Init(void){DDRD&=(uint8_t)~(1<<DDD2);PORTD|=(1<<PORTD2);EICRA=(EICRA&(uint8_t)~((1<<ISC01)|(1<<ISC00)))|(1<<ISC01);EIFR=(1<<INTF0);EIMSK|=(1<<INT0);}
-static void Display_ShowCount(uint16_t count){(void)count; /* Indsaet display-driver her. */}
 
-ISR(INT0_vect){external_count++;external_event=1;EICRA=(EICRA&(uint8_t)~((1<<ISC01)|(1<<ISC00)))|(1<<ISC01)|(1<<ISC00);}
-ISR(USART0_RX_vect){uint8_t c=UDR0;if(c>='a'&&c<='z')c=(uint8_t)(c-('a'-'A'));U0c((char)c);}
-ISR(USART1_RX_vect){uint8_t c=UDR1;if(c>='A'&&c<='Z')c=(uint8_t)(c+('a'-'A'));U1c((char)c);}
+static void Button_Init(void) {
+    DDRD &= ~(1 << DDD2);
+    PORTD |= (1 << PORTD2); /* Button from PD2 to GND. */
+    EICRA = (EICRA & ~((1 << ISC01) | (1 << ISC00))) | (1 << ISC00);
+    EIFR = (1 << INTF0);
+    EIMSK |= (1 << INT0);
+}
 
-int main(void){
-  DDRB|=(1<<GreenLedBit);UART_Init();INT0_Init();Timer1_Init_ms(1000);sei();
-  while(1){
-    if(external_event){uint16_t n;cli();external_event=0;n=external_count;sei();U0s("Ekstern interrupt: ");Number(n,U0c);U0s("\r\n");U1s("Ekstern interrupt: ");Number(n,U1c);U1s("\r\n");Display_ShowCount(n);}
-    if(timer_second_flag){uint32_t n;cli();timer_second_flag=0;seconds++;n=seconds;sei();U1s("Sekund: ");Number(n,U1c);U1s("\r\n");}
-  }
+static void Display_Line(uint8_t line) {
+    char text[22]; /* 128 / 6 = 21 characters per line. */
+    uint32_t falling, rising, seconds;
+    UART_Stats stats;
+    ATOMIC_BLOCK(ATOMIC_RESTORESTATE) {
+        falling = falling_edges;
+        rising = rising_edges;
+        seconds = timer_seconds;
+    }
+    UART_GetStats(&stats);
+    switch (line) {
+    case 0: snprintf(text, sizeof text, "Ned: %lu", (unsigned long)falling); break;
+    case 1: snprintf(text, sizeof text, "Op:  %lu", (unsigned long)rising); break;
+    case 2: snprintf(text, sizeof text, "Sek: %lu", (unsigned long)seconds); break;
+    case 3:
+        snprintf(text, sizeof text, "%03u %03u %03u %03u %03u",
+                 stats.last[0], stats.last[1], stats.last[2], stats.last[3], stats.last[4]);
+        break;
+    case 4: snprintf(text, sizeof text, "Embedded Styrer !!!"); break;
+    case 5: snprintf(text, sizeof text, "Buffer max: %u/255", stats.high_water); break;
+    case 6: snprintf(text, sizeof text, "Tab: %lu", (unsigned long)stats.overruns); break;
+    default: snprintf(text, sizeof text, "Lonneberg state: %u", stats.state); break;
+    }
+    ssd1306_write_line(line, text);
+}
+
+int main(void) {
+    uint8_t display_ok, pending_lines = 0xff;
+    DDRB |= (1 << GreenLedBit) | (1 << YellowLedBit);
+    /* A missing display must not block the UART test. */
+    display_ok = (ssd1306_init() == 0);
+    if (display_ok) ssd1306_clear();
+    RS232Init();
+    Button_Init();
+    Timer1_Init_ms(1000);
+    sei();
+    for (;;) {
+        UART_Service(); /* Prepare reports; byte transfer uses short ISRs. */
+        ATOMIC_BLOCK(ATOMIC_RESTORESTATE) {
+            if (timer_second_flag) {
+                timer_second_flag = 0;
+                pending_lines = 0xff;
+            }
+            if (button_dirty) {
+                button_dirty = 0;
+                pending_lines |= 3;
+            }
+        }
+        if (display_ok && pending_lines) {
+            /* Service UART between each display line. */
+            uint8_t line = 0;
+            while (!(pending_lines & (1 << line))) line++;
+            pending_lines &= ~(1 << line);
+            Display_Line(line);
+        }
+    }
 }

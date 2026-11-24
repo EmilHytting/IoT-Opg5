@@ -3,6 +3,7 @@
 #include <avr/io.h>
 
 volatile uint8_t timer_second_flag = 0;
+volatile uint32_t timer_seconds = 0;
 
 void Timer1_Init_ms(uint16_t timeout_ms) {
   TCCR1A = 0;
@@ -23,6 +24,7 @@ void Timer1_Init_ms(uint16_t timeout_ms) {
 }
 
 ISR(TIMER1_COMPA_vect) {
+  timer_seconds++;
   PORTB ^= (1 << GreenLedBit);
   timer_second_flag = 1;
 }
